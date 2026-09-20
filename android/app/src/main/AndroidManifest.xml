@@ -1,0 +1,120 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Android 13+ granular media permissions. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+    <!-- Android 12 and below. maxSdkVersion keeps Android 13+ on the granular ones above. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!--
+      Needed to read folders MediaStore does not index (Documents, Movies, and
+      any custom folder the user binds). Without it those folders scan as empty.
+      This is a sideloaded personal backup tool; Play Store distribution would
+      require a declared-use exemption for this permission.
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- Android 13+ runtime permission for the progress notification. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ requires the specific foreground service type. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Lets WorkManager reschedule the periodic sync after a reboot. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+      android:name=".MainApplication"
+      android:label="@string/app_name"
+      android:icon="@mipmap/ic_launcher"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:allowBackup="false"
+      android:theme="@style/AppTheme"
+      android:usesCleartextTraffic="${usesCleartextTraffic}"
+      android:requestLegacyExternalStorage="true"
+      android:supportsRtl="true">
+
+      <activity
+        android:name=".MainActivity"
+        android:label="@string/app_name"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:launchMode="singleTask"
+        android:windowSoftInputMode="adjustResize"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+      </activity>
+
+      <!-- Keeps the process alive during a user-initiated sync. -->
+      <service
+        android:name=".sync.SyncForegroundService"
+        android:exported="false"
+        android:foregroundServiceType="dataSync" />
+
+      <!--
+        Runs the JS sync engine for the scheduled job.
+
+        This one is started as a PLAIN service: SyncWorker has already called
+        setForeground(), so WorkManager owns the foreground service and its
+        notification, and the process is alive by the time this starts.
+        React Native's HeadlessJsTaskService never calls startForeground
+        itself, so the type below is currently inert. It is declared anyway so
+        that promoting this service directly cannot fail with
+        MissingForegroundServiceTypeException on Android 14+.
+      -->
+      <service
+        android:name=".sync.SyncHeadlessTaskService"
+        android:exported="false"
+        android:foregroundServiceType="dataSync" />
+
+      <!--
+        The scheduled sync's foreground service.
+
+        SyncWorker calls setForeground(), and WorkManager runs that on ITS OWN
+        service, androidx.work.impl.foreground.SystemForegroundService — not on
+        any service declared above. WorkManager's AAR declares that service
+        without a foregroundServiceType, so on Android 14+ promoting it throws
+        MissingForegroundServiceTypeException and the scheduled sync dies.
+        tools:node="merge" adds the type onto WorkManager's own declaration.
+      -->
+      <service
+        android:name="androidx.work.impl.foreground.SystemForegroundService"
+        android:foregroundServiceType="dataSync"
+        tools:node="merge" />
+
+      <!-- Notification Pause / Resume / Stop buttons. -->
+      <receiver
+        android:name=".sync.SyncActionReceiver"
+        android:exported="false">
+        <intent-filter>
+            <action android:name="com.telegrambackup.sync.PAUSE" />
+            <action android:name="com.telegrambackup.sync.RESUME" />
+            <action android:name="com.telegrambackup.sync.STOP" />
+        </intent-filter>
+      </receiver>
+
+      <receiver
+        android:name=".sync.BootReceiver"
+        android:enabled="true"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.BOOT_COMPLETED" />
+            <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+        </intent-filter>
+      </receiver>
+    </application>
+</manifest>

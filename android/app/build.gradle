@@ -118,6 +118,12 @@ dependencies {
     // ServiceCompat.startForeground with a foregroundServiceType (Android 14).
     implementation("androidx.core:core-ktx:1.15.0")
 
+    // On-device smart search. The Play services variants keep the models out
+    // of the APK: Google Play services downloads and shares them, so the app
+    // grows by well under 1 MB. Nothing is sent to any server.
+    implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.1")
+    implementation("com.google.android.gms:play-services-mlkit-image-labeling:16.0.8")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {

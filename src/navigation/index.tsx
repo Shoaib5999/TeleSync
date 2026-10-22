@@ -10,10 +10,12 @@ import SettingsScreen from '../screens/SettingsScreen';
 import LoginScreen from '../screens/LoginScreen';
 import LibraryScreen from '../screens/LibraryScreen';
 import DeletionsScreen from '../screens/DeletionsScreen';
+import VaultScreen from '../screens/vault/VaultScreen';
 
 export type RootTabParamList = {
   Home: undefined;
   Library: undefined;
+  Vault: undefined;
   Folders: undefined;
   Topics: undefined;
   Deletions: undefined;
@@ -29,6 +31,7 @@ type IconName = React.ComponentProps<typeof MaterialDesignIcons>['name'];
 const ICONS: Record<keyof RootTabParamList, IconName> = {
   Home: 'cloud-upload',
   Library: 'image-multiple',
+  Vault: 'shield-lock',
   Folders: 'folder-multiple',
   Topics: 'forum',
   Deletions: 'delete-alert-outline',
@@ -71,6 +74,7 @@ export default function RootNavigator({
             component={LibraryScreen}
             options={{ title: 'Restore' }}
           />
+          <Tab.Screen name="Vault" component={VaultScreen} />
           <Tab.Screen name="Folders" component={FoldersScreen} />
           <Tab.Screen name="Topics" component={TopicsScreen} />
           <Tab.Screen

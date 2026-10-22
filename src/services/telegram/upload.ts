@@ -2,6 +2,8 @@ import ReactNativeBlobUtil from 'react-native-blob-util';
 import bigInt from 'big-integer';
 import { errors } from 'teleproto';
 
+import QuickCrypto from 'react-native-quick-crypto';
+
 import { Api, getChannel, getClient } from './client';
 import { vault } from '../crypto/vault';
 import { logger, describeError } from '../../utils/logger';
@@ -46,12 +48,19 @@ export interface UploadOptions {
   onProgress?: (fraction: number) => void;
   /** Called when Telegram forces a wait, so the UI can explain the pause. */
   onFloodWait?: (seconds: number) => void;
+  /**
+   * Builds the message caption once the content hash is known (just before
+   * the message is sent). Omitted or '' sends no caption, as before.
+   */
+  buildCaption?: (contentHash: string | null) => Promise<string>;
 }
 
 export interface UploadResult {
   messageId: number;
   /** The name the file was stored under; differs when encrypted. */
   storedName: string;
+  /** SHA-256 hex of the original (plaintext) bytes. */
+  contentHash: string | null;
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -124,7 +133,7 @@ function guessMimeType(fileName: string): string {
  * to wait, so obeying it is the correct behaviour, not a failure. Only genuine
  * network errors consume the retry budget.
  */
-async function withRetries<T>(
+export async function withRetries<T>(
   label: string,
   signal: AbortSignal,
   onFloodWait: ((seconds: number) => void) | undefined,
@@ -250,13 +259,16 @@ export async function uploadFile(
   // sends that. Keeping the stages separate means encrypted and plain uploads
   // share one well-tested upload path, and memory stays flat either way.
   let encryptedTemp: string | null = null;
+  // Encryption hashes the plaintext as it reads it; plain uploads hash the
+  // chunks the uploader reads. Either way the file is read only once.
+  let plainHash: string | null = null;
 
   if (options.encrypt) {
     encryptedTemp = `${ReactNativeBlobUtil.fs.dirs.CacheDir}/tgbackup-enc-${Date.now()}-${Math.random()
       .toString(36)
       .slice(2)}.tgbk`;
     try {
-      await vault.encryptFile(localPath, encryptedTemp);
+      plainHash = await vault.encryptFile(localPath, encryptedTemp);
     } catch (error) {
       try {
         await ReactNativeBlobUtil.fs.unlink(encryptedTemp);
@@ -273,6 +285,7 @@ export async function uploadFile(
       encryptedTemp ?? localPath,
       // The real name lives in SQLite; the uploaded blob reveals nothing.
       encryptedTemp ? `${fileName}.tgbk` : fileName,
+      encryptedTemp ? plainHash : undefined,
     );
   } finally {
     if (encryptedTemp) {
@@ -285,11 +298,17 @@ export async function uploadFile(
   }
 }
 
-/** The chunked upload itself, working on whatever bytes it is handed. */
+/**
+ * The chunked upload itself, working on whatever bytes it is handed.
+ *
+ * `knownHash` is the plaintext hash when the bytes here are ciphertext;
+ * undefined means these bytes ARE the original, so hash them in passing.
+ */
 async function uploadPreparedFile(
   options: UploadOptions,
   localPath: string,
   fileName: string,
+  knownHash?: string | null,
 ): Promise<UploadResult> {
   const { topicId, signal } = options;
 
@@ -316,12 +335,18 @@ async function uploadPreparedFile(
     .toString(36)
     .slice(2)}.part`;
 
+  const hasher =
+    knownHash === undefined ? QuickCrypto.createHash('sha256') : null;
+
   for (let part = 0; part < totalParts; part += 1) {
     throwIfAborted(signal);
 
     const start = part * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, size);
     const bytes = await readChunk(localPath, start, end, tmpPath);
+    // Hashed once per chunk, outside the retry loop, so a resend of the same
+    // part never feeds the hash twice.
+    hasher?.update(bytes);
 
     await withRetries(
       `part ${part + 1}/${totalParts} of ${fileName}`,
@@ -366,6 +391,23 @@ async function uploadPreparedFile(
     forceFile: options.asDocument,
   });
 
+  const contentHash: string | null = hasher
+    ? (hasher.digest('hex') as string)
+    : (knownHash ?? null);
+
+  let caption = '';
+  if (options.buildCaption) {
+    try {
+      caption = await options.buildCaption(contentHash);
+    } catch (error) {
+      // A caption is metadata; it must never cost the upload itself.
+      logger.warn(
+        'upload',
+        `No caption for ${fileName}: ${describeError(error)}`,
+      );
+    }
+  }
+
   // Posting into a forum topic means replying to the topic's root message.
   const replyTo =
     topicId !== null
@@ -384,7 +426,18 @@ async function uploadPreparedFile(
         new Api.messages.SendMedia({
           peer,
           media,
-          message: '',
+          message: caption,
+          // A spoiler keeps the index tag to one small blurred line in
+          // Telegram. Offsets are UTF-16, which is what JS lengths count.
+          entities:
+            caption.length > 0
+              ? [
+                  new Api.MessageEntitySpoiler({
+                    offset: 0,
+                    length: caption.length,
+                  }),
+                ]
+              : undefined,
           randomId: randomLong(),
           replyTo,
         }),
@@ -409,7 +462,7 @@ async function uploadPreparedFile(
   }
 
   logger.info('upload', `Uploaded ${fileName} as message #${messageId}`);
-  return { messageId, storedName: fileName };
+  return { messageId, storedName: fileName, contentHash };
 }
 
 function extractMessageId(updates: Api.TypeUpdates): number | null {

@@ -46,6 +46,15 @@
       android:requestLegacyExternalStorage="true"
       android:supportsRtl="true">
 
+      <!--
+        Asks Google Play services to download the on-device search models
+        (text recognition, image labelling) at install time instead of on the
+        first search. ocr = text recognition, ica = image labelling.
+      -->
+      <meta-data
+        android:name="com.google.mlkit.vision.DEPENDENCIES"
+        android:value="ocr,ica" />
+
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"

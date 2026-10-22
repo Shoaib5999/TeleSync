@@ -1,7 +1,7 @@
 import ReactNativeBlobUtil from 'react-native-blob-util';
 
 import { Api, getChannel, getClient } from './client';
-import { vault } from '../crypto/vault';
+import { vault, VaultPassphraseRequiredError } from '../crypto/vault';
 import { filesRepo } from '../db/schema';
 import { logger, describeError } from '../../utils/logger';
 import type { FileRecord } from '../../types';
@@ -67,7 +67,7 @@ export function originalNameOf(record: FileRecord): string {
 }
 
 /** Fetches the message that holds a backed-up file. */
-async function fetchMessage(messageId: number): Promise<Api.Message> {
+export async function fetchMessage(messageId: number): Promise<Api.Message> {
   const client = await getClient();
   const peer = await getChannel();
 
@@ -98,6 +98,97 @@ async function fetchMessage(messageId: number): Promise<Api.Message> {
 export interface FetchOptions {
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
+  /**
+   * For encrypted files whose key this device does not know yet (a backup made
+   * on another phone or before a reinstall). See vault.decryptFile.
+   */
+  passphrase?: string;
+}
+
+/** Expected byte size of a message's file, when Telegram tells us. */
+function expectedSizeOf(message: Api.Message): number | null {
+  const media = message.media;
+  if (
+    media instanceof Api.MessageMediaDocument &&
+    media.document instanceof Api.Document
+  ) {
+    return Number(media.document.size);
+  }
+  return null;
+}
+
+/**
+ * Streams a message's file straight to `destPath`, one part at a time.
+ *
+ * teleproto's default returns the whole file as one Buffer, which a large
+ * video cannot survive: the bytes plus their base64 copy exceed the JS heap.
+ * Handing it a writer instead keeps memory bounded by the parts in flight.
+ * teleproto serialises writes in file order (OrderedWriter), so appending
+ * each one is safe.
+ *
+ * Writes to a part file unique to this call and renames it on success, so a
+ * file at `destPath` is always complete, even if an earlier, aborted download
+ * of the same file is still draining its last writes.
+ */
+export async function downloadMessageToFile(
+  message: Api.Message,
+  destPath: string,
+  options: FetchOptions = {},
+): Promise<void> {
+  const partPath = `${destPath}.${uniqueSuffix()}.part`;
+
+  let created = false;
+  let written = 0;
+  const writer = {
+    async write(data: Buffer): Promise<void> {
+      const encoded = Buffer.from(data).toString('base64');
+      if (created) {
+        await ReactNativeBlobUtil.fs.appendFile(partPath, encoded, 'base64');
+      } else {
+        await ReactNativeBlobUtil.fs.createFile(partPath, encoded, 'base64');
+        created = true;
+      }
+      written += data.length;
+    },
+    close(): void {
+      // Nothing held open; every write already reached disk.
+    },
+  };
+
+  try {
+    await (
+      await getClient()
+    ).downloadMedia(message, {
+      // teleproto accepts any object with write()/close() as the output.
+      outputFile: writer as unknown as string,
+      signal: options.signal,
+      progressCallback: (received, total) => {
+        const totalBytes = Number(total);
+        if (totalBytes > 0) {
+          options.onProgress?.(Number(received) / totalBytes);
+        }
+      },
+    });
+
+    // An aborted download returns normally, so check rather than trust it.
+    if (options.signal?.aborted) {
+      throw new Error('Cancelled');
+    }
+    const expected = expectedSizeOf(message);
+    if (!created || (expected !== null && written !== expected)) {
+      throw new Error(
+        `Download incomplete (${written} of ${expected ?? '?'} bytes).`,
+      );
+    }
+    await ReactNativeBlobUtil.fs.mv(partPath, destPath);
+  } catch (error) {
+    try {
+      await ReactNativeBlobUtil.fs.unlink(partPath);
+    } catch {
+      // Best effort.
+    }
+    throw error;
+  }
 }
 
 /**
@@ -120,58 +211,73 @@ export async function fetchToCache(
     return target;
   }
 
-  const message = await fetchMessage(record.message_id);
-
   logger.info(
     'download',
     `Fetching ${name} (message #${record.message_id})${record.encrypted ? ', encrypted' : ''}`,
   );
 
-  // teleproto handles part sizing and any cross-DC redirect internally. With no
-  // output path it returns a Buffer, which never touches the Node fs shim.
-  const data = (await (
-    await getClient()
-  ).downloadMedia(message, {
-    progressCallback: (received, total) => {
-      const receivedBytes = Number(received);
-      const totalBytes = Number(total);
-      if (totalBytes > 0) {
-        options.onProgress?.(receivedBytes / totalBytes);
-      }
-    },
-  })) as Buffer | string | undefined;
-
-  if (!data || typeof data === 'string') {
-    throw new Error(`Could not download ${name}.`);
-  }
-
   if (!record.encrypted) {
-    await ReactNativeBlobUtil.fs.createFile(
-      target,
-      Buffer.from(data).toString('base64'),
-      'base64',
-    );
+    const message = await fetchMessage(record.message_id);
+    await downloadMessageToFile(message, target, options);
     return target;
   }
 
   // Encrypted: land the ciphertext, decrypt to the target, drop the ciphertext.
+  // A ciphertext left by an attempt that needed a passphrase is reused, so
+  // entering it does not download the file a second time.
   const cipherPath = `${target}.tgbk`;
-  await ReactNativeBlobUtil.fs.createFile(
-    cipherPath,
-    Buffer.from(data).toString('base64'),
-    'base64',
-  );
-  try {
-    await vault.decryptFile(cipherPath, target);
-  } finally {
-    try {
-      await ReactNativeBlobUtil.fs.unlink(cipherPath);
-    } catch {
-      // Best effort.
-    }
+  if (!(await ReactNativeBlobUtil.fs.exists(cipherPath))) {
+    const message = await fetchMessage(record.message_id);
+    await downloadMessageToFile(message, cipherPath, options);
+  } else {
+    options.onProgress?.(1);
   }
 
+  await decryptCached(cipherPath, target, options.passphrase);
   return target;
+}
+
+/**
+ * Decrypts a downloaded ciphertext and removes it, except when the only
+ * problem is a missing or wrong passphrase: then it stays for the retry.
+ */
+export async function decryptCached(
+  cipherPath: string,
+  target: string,
+  passphrase?: string,
+): Promise<void> {
+  // Decrypt beside the target and rename, so two overlapping attempts (a quick
+  // swipe away and back) never interleave writes into one file.
+  const temp = `${target}.${uniqueSuffix()}.dec`;
+  try {
+    await vault.decryptFile(cipherPath, temp, { passphrase });
+    await ReactNativeBlobUtil.fs.mv(temp, target);
+  } catch (error) {
+    await unlinkQuietly(temp);
+    if (await ReactNativeBlobUtil.fs.exists(target)) {
+      // An overlapping attempt finished first and already consumed the
+      // ciphertext; its result is complete and verified.
+      return;
+    }
+    if (error instanceof VaultPassphraseRequiredError) {
+      throw error;
+    }
+    await unlinkQuietly(cipherPath);
+    throw error;
+  }
+  await unlinkQuietly(cipherPath);
+}
+
+function uniqueSuffix(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function unlinkQuietly(path: string): Promise<void> {
+  try {
+    await ReactNativeBlobUtil.fs.unlink(path);
+  } catch {
+    // Best effort.
+  }
 }
 
 /**

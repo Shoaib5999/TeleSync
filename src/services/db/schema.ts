@@ -83,6 +83,10 @@ function migrate(handle: DB): void {
     'INTEGER NOT NULL DEFAULT 0',
   );
   addColumnIfMissing(handle, 'files', 'file_name', 'TEXT');
+  // SHA-256 of the original bytes. Lets a file whose mtime changed (copied to
+  // a new phone, touched by a gallery app) be recognised as unchanged instead
+  // of re-uploaded, and is carried in the index snapshot and caption tag.
+  addColumnIfMissing(handle, 'files', 'content_hash', 'TEXT');
 
   handle.executeSync(
     'CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);',
@@ -145,6 +149,10 @@ function toFileRecord(row: Record<string, Scalar>): FileRecord {
       row.file_name === null || row.file_name === undefined
         ? null
         : asString(row.file_name),
+    content_hash:
+      row.content_hash === null || row.content_hash === undefined
+        ? null
+        : asString(row.content_hash),
   };
 }
 
@@ -197,10 +205,12 @@ export const filesRepo = {
     topicId: number | null;
     encrypted: boolean;
     fileName: string;
+    /** SHA-256 hex of the original bytes; null when it could not be computed. */
+    contentHash?: string | null;
   }): Promise<void> {
     await getDb().execute(
-      `INSERT INTO files (local_path, size, mtime, message_id, topic_id, uploaded_at, status, encrypted, file_name)
-       VALUES (?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)
+      `INSERT INTO files (local_path, size, mtime, message_id, topic_id, uploaded_at, status, encrypted, file_name, content_hash)
+       VALUES (?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?)
        ON CONFLICT(local_path) DO UPDATE SET
          size = excluded.size,
          mtime = excluded.mtime,
@@ -209,7 +219,8 @@ export const filesRepo = {
          uploaded_at = excluded.uploaded_at,
          status = 'uploaded',
          encrypted = excluded.encrypted,
-         file_name = excluded.file_name;`,
+         file_name = excluded.file_name,
+         content_hash = excluded.content_hash;`,
       [
         params.localPath,
         params.size,
@@ -219,8 +230,116 @@ export const filesRepo = {
         Math.floor(Date.now() / 1000),
         params.encrypted ? 1 : 0,
         params.fileName,
+        params.contentHash ?? null,
       ],
     );
+  },
+
+  /**
+   * Accepts a new mtime for a file whose bytes were proven unchanged by hash,
+   * so the next scan skips it on the cheap size+mtime check again.
+   */
+  async updateMtime(localPath: string, mtime: number): Promise<void> {
+    await getDb().execute('UPDATE files SET mtime = ? WHERE local_path = ?;', [
+      mtime,
+      localPath,
+    ]);
+  },
+
+  async setContentHash(localPath: string, hash: string): Promise<void> {
+    await getDb().execute(
+      'UPDATE files SET content_hash = ? WHERE local_path = ?;',
+      [hash, localPath],
+    );
+  },
+
+  /** Uploaded rows that predate hashing, for the background backfill. */
+  async missingHash(limit: number): Promise<FileRecord[]> {
+    const result = await getDb().execute(
+      "SELECT * FROM files WHERE status = 'uploaded' AND content_hash IS NULL ORDER BY size ASC LIMIT ?;",
+      [limit],
+    );
+    return result.rows.map(toFileRecord);
+  },
+
+  /** Every uploaded row, for the index snapshot and the search feeder. */
+  async allUploaded(): Promise<FileRecord[]> {
+    const result = await getDb().execute(
+      "SELECT * FROM files WHERE status = 'uploaded' ORDER BY id;",
+    );
+    return result.rows.map(toFileRecord);
+  },
+
+  /** Uploaded rows recorded at or after `since` (unix seconds). */
+  async uploadedSince(since: number): Promise<FileRecord[]> {
+    const result = await getDb().execute(
+      "SELECT * FROM files WHERE status = 'uploaded' AND uploaded_at >= ? ORDER BY uploaded_at;",
+      [since],
+    );
+    return result.rows.map(toFileRecord);
+  },
+
+  /** Rows for these paths, in one query per 500 (SQLite's variable limit). */
+  async byPaths(paths: string[]): Promise<FileRecord[]> {
+    const out: FileRecord[] = [];
+    for (let i = 0; i < paths.length; i += 500) {
+      const slice = paths.slice(i, i + 500);
+      const result = await getDb().execute(
+        `SELECT * FROM files WHERE local_path IN (${slice.map(() => '?').join(',')});`,
+        slice,
+      );
+      out.push(...result.rows.map(toFileRecord));
+    }
+    return out;
+  },
+
+  async count(): Promise<number> {
+    const result = await getDb().execute('SELECT COUNT(*) AS c FROM files;');
+    return asNumber(result.rows[0]?.c);
+  },
+
+  /**
+   * Writes a recovered index in one transaction, so 20k rows land in well
+   * under a second and a failure leaves the table exactly as it was.
+   * Existing rows win: a restore never overwrites what this install recorded.
+   */
+  async insertRecovered(
+    rows: {
+      localPath: string;
+      size: number;
+      mtime: number;
+      messageId: number;
+      topicId: number | null;
+      encrypted: boolean;
+      fileName: string;
+      contentHash: string | null;
+      uploadedAt: number;
+    }[],
+  ): Promise<number> {
+    if (rows.length === 0) {
+      return 0;
+    }
+    const before = await this.count();
+    const sql = `INSERT INTO files (local_path, size, mtime, message_id, topic_id, uploaded_at, status, encrypted, file_name, content_hash)
+       VALUES (?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?)
+       ON CONFLICT(local_path) DO NOTHING;`;
+    await getDb().executeBatch(
+      rows.map(row => [
+        sql,
+        [
+          row.localPath,
+          row.size,
+          row.mtime,
+          row.messageId,
+          row.topicId,
+          row.uploadedAt,
+          row.encrypted ? 1 : 0,
+          row.fileName,
+          row.contentHash,
+        ],
+      ]),
+    );
+    return (await this.count()) - before;
   },
 
   /** Every uploaded row whose path sits under `folder`. */

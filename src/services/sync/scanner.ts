@@ -5,6 +5,7 @@ import { CameraRoll } from '@react-native-camera-roll/camera-roll';
 import { pickDirectory } from '@react-native-documents/picker';
 
 import { filesRepo } from '../db/schema';
+import { hashLocalFile } from '../index/hash';
 import { logger, describeError } from '../../utils/logger';
 import type { AppConfig, SyncTarget, UploadJob } from '../../types';
 import type { Router } from './router';
@@ -284,6 +285,18 @@ export async function scan(
       if (unchanged) {
         skipped += 1;
         continue;
+      }
+      // Same size, new mtime: often the bytes did not change at all (files
+      // copied to a new phone, a gallery app touching metadata). When the
+      // hash proves that, accept the new mtime instead of re-uploading. Any
+      // doubt (no stored hash, hashing failed) keeps the old behaviour.
+      if (existing.size === file.size && existing.content_hash) {
+        const hash = await hashLocalFile(file.path);
+        if (hash !== null && hash === existing.content_hash) {
+          await filesRepo.updateMtime(file.path, file.mtime);
+          skipped += 1;
+          continue;
+        }
       }
       // Contents changed: re-upload, and replace the old message.
       const route = router.route(file.path);

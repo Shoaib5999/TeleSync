@@ -19,6 +19,8 @@ import { vault } from '../services/crypto/vault';
 import { clearPreviewCache } from '../services/telegram/download';
 import { cancelScheduledSync, scheduleSync } from '../background/scheduler';
 import { describeError } from '../utils/logger';
+import IndexCard from './index/IndexCard';
+import type { AppConfig } from '../types';
 
 /** Parses a numeric field, falling back to the previous value when unusable. */
 function parseNumber(value: string, fallback: number): number {
@@ -50,6 +52,15 @@ export default function SettingsScreen(): React.JSX.Element {
 
   useEffect(() => {
     void vault.isUnlocked().then(setVaultReady);
+  }, []);
+
+  /** Refreshes the draft fields after a restore wrote new settings. */
+  const onSettingsRestored = useCallback((next: AppConfig) => {
+    setThrottle(String(next.throttleSeconds));
+    setMaxFileMb(String(next.maxFileMb));
+    setInterval(String(next.syncIntervalHours));
+    setExtensions(next.extensions.join(', '));
+    setRootTopic(next.rootTopicId ? String(next.rootTopicId) : '');
   }, []);
 
   const onSetPassphrase = useCallback(async () => {
@@ -343,6 +354,11 @@ export default function SettingsScreen(): React.JSX.Element {
           </Card.Actions>
         </Card>
 
+        <IndexCard
+          onMessage={setMessage}
+          onSettingsRestored={onSettingsRestored}
+        />
+
         <Card mode="outlined" style={styles.card}>
           <Card.Title title="Account and data" />
           <Card.Actions style={styles.dangerActions}>
@@ -360,8 +376,9 @@ export default function SettingsScreen(): React.JSX.Element {
           <Dialog.Content>
             <Text variant="bodyMedium">
               This wipes the record of what has already been uploaded. Nothing
-              is deleted from Telegram — but the next sync will re-upload
-              everything, creating duplicates in the channel.
+              is deleted from Telegram. Afterwards, use Backup index → Restore
+              to rebuild it; syncing without restoring re-uploads everything,
+              creating duplicates in the channel.
             </Text>
           </Dialog.Content>
           <Dialog.Actions>

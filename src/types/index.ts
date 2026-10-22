@@ -20,6 +20,8 @@ export interface FileRecord {
   encrypted: boolean;
   /** Original filename, needed to restore an encrypted blob under its real name. */
   file_name: string | null;
+  /** SHA-256 hex of the original bytes. null for rows that predate hashing. */
+  content_hash: string | null;
 }
 
 /** Row in the `topics` table: a Telegram forum topic we can route files into. */

@@ -13,6 +13,8 @@ import ReactNativeBlobUtil from 'react-native-blob-util';
 import { buildRouter, type Router } from './router';
 import { scan } from './scanner';
 import { UploadQueue, type JobResult } from './queue';
+import { buildCaption } from '../index/caption';
+import { checkRestoreGuard } from '../index/guard';
 
 /**
  * The one sync implementation.
@@ -147,6 +149,20 @@ class SyncEngine {
       }
 
       const config = await configRepo.load();
+
+      // A fresh install whose channel already holds an index must restore it
+      // (or decline) first; otherwise every file uploads a second time.
+      const blocked = await checkRestoreGuard();
+      if (blocked) {
+        logger.warn('engine', blocked);
+        this.update({
+          phase: 'error',
+          errorMessage: blocked,
+          lastSyncAt: Date.now(),
+        });
+        return this.progress;
+      }
+
       const router = await buildRouter(config.rootTopicId);
       const effectiveTarget = target ?? (await buildDefaultTarget(config));
 
@@ -218,7 +234,7 @@ class SyncEngine {
             });
 
             try {
-              const { messageId } = await uploadFile({
+              const { messageId, contentHash } = await uploadFile({
                 localPath: job.localPath,
                 fileName: job.fileName,
                 size: job.size,
@@ -235,6 +251,16 @@ class SyncEngine {
                     'engine',
                     `Waiting ${seconds}s for Telegram rate limit`,
                   ),
+                buildCaption: hash =>
+                  buildCaption(
+                    {
+                      localPath: job.localPath,
+                      size: job.size,
+                      mtime: job.mtime,
+                      contentHash: hash,
+                    },
+                    job.encrypt,
+                  ),
               });
 
               await filesRepo.markUploaded({
@@ -245,6 +271,7 @@ class SyncEngine {
                 topicId: job.topicId,
                 encrypted: job.encrypt,
                 fileName: job.fileName,
+                contentHash,
               });
 
               this.update({ uploaded: this.progress.uploaded + 1 });

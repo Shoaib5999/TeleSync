@@ -4,14 +4,20 @@ import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.NativeModule
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.uimanager.ViewManager
+import com.telegrambackup.index.FileHashModule
+import com.telegrambackup.search.SearchModule
+import com.telegrambackup.vault.VaultModule
 
-/** Registers the two native modules with React Native. */
+/** Registers the app's native modules with React Native. */
 class SyncPackage : ReactPackage {
 
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
         listOf(
             SyncControlModule(reactContext),
             SyncSchedulerModule(reactContext),
+            VaultModule(reactContext),
+            FileHashModule(reactContext),
+            SearchModule(reactContext),
         )
 
     override fun createViewManagers(

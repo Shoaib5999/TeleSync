@@ -12,6 +12,7 @@ import { logger } from '../../utils/logger';
 const SERVICE_SESSION = 'com.telegrambackup.session';
 const SERVICE_API_HASH = 'com.telegrambackup.apihash';
 const SERVICE_VAULT_KEY = 'com.telegrambackup.vaultkey';
+const SERVICE_VAULT_KEYRING = 'com.telegrambackup.vaultkeyring';
 
 /** Keychain stores username/password pairs; we only need the password half. */
 const ACCOUNT = 'telegram';
@@ -106,6 +107,37 @@ export const secureStore = {
       await clear(SERVICE_VAULT_KEY);
     } catch (error) {
       logger.error('keychain', 'Failed to clear vault key', error);
+    }
+  },
+
+  /**
+   * Keys for decrypting backups, grouped by the KDF salt they were derived
+   * with, as JSON `{ saltBase64: [keyBase64, ...] }`. Holds keys for backups
+   * made on other devices or installs, whose salt differs from this one's.
+   */
+  async setVaultKeyring(json: string): Promise<void> {
+    try {
+      await write(SERVICE_VAULT_KEYRING, json);
+    } catch (error) {
+      logger.error('keychain', 'Failed to persist vault keyring', error);
+      throw error;
+    }
+  },
+
+  async getVaultKeyring(): Promise<string | null> {
+    try {
+      return await read(SERVICE_VAULT_KEYRING);
+    } catch (error) {
+      logger.error('keychain', 'Failed to read vault keyring', error);
+      return null;
+    }
+  },
+
+  async clearVaultKeyring(): Promise<void> {
+    try {
+      await clear(SERVICE_VAULT_KEYRING);
+    } catch (error) {
+      logger.error('keychain', 'Failed to clear vault keyring', error);
     }
   },
 

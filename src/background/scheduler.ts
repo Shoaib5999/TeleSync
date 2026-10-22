@@ -8,6 +8,7 @@ import {
   stopForegroundService,
 } from './foreground';
 import { configRepo } from '../services/db/schema';
+import { afterSync } from '../services/index/afterSync';
 import { logger, describeError } from '../utils/logger';
 import type { SyncTarget } from '../types';
 
@@ -132,6 +133,9 @@ export async function headlessSyncTask(data?: HeadlessSyncData): Promise<void> {
       'scheduler',
       `Headless sync finished: ${progress.uploaded} uploaded, ${progress.failed} failed`,
     );
+    // Snapshot the index and similar upkeep, while the service still holds
+    // the process in the foreground.
+    await afterSync(progress);
     if (syncEngine.pendingDeletionNotice > 0) {
       await notifyPendingDeletions(syncEngine.pendingDeletionNotice);
       syncEngine.pendingDeletionNotice = 0;
